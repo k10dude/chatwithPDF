@@ -1,6 +1,7 @@
 import streamlit as st
 import openai
-import chromadb
+import faiss
+import numpy as np
 from PyPDF2 import PdfReader
 import os
 from dotenv import load_dotenv
@@ -11,64 +12,47 @@ import hashlib
 # ------------------------------
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
-CHROMA_DB_DIR = "./chroma_db"
 
-# Initialize ChromaDB
-chroma_client = chromadb.Client()
-if not os.path.exists(CHROMA_DB_DIR):
-    os.makedirs(CHROMA_DB_DIR)
-collection = chroma_client.get_or_create_collection(name="pdf_data")
-
-# Keep track of uploaded PDFs
-if "pdf_files" not in st.session_state:
-    st.session_state.pdf_files = {}
+# Initialize FAISS
+embedding_size = 1536  # OpenAI embedding dimension
+index = faiss.IndexFlatL2(embedding_size)  # FAISS index
+stored_texts = []  # to hold actual text chunks
+metadata = []  # to hold filenames etc.
 
 # ------------------------------
 # HELPER FUNCTIONS
 # ------------------------------
-def generate_doc_id(text, filename):
-    """Generate unique ID for a text chunk + filename using SHA256."""
-    combined = filename + text
-    return hashlib.sha256(combined.encode('utf-8')).hexdigest()
+def get_embedding(text):
+    """Generate embedding using OpenAI."""
+    result = openai.Embedding.create(
+        input=text,
+        model="text-embedding-ada-002"
+    )
+    return np.array(result['data'][0]['embedding'], dtype="float32")
 
 def embed_and_store_text(texts, filename):
-    """Embed text chunks if not already stored."""
+    """Embed text chunks and add to FAISS index with metadata."""
     for text in texts:
-        if not text.strip():  # Skip empty pages
-            continue
-        doc_id = generate_doc_id(text, filename)
-        existing = collection.get(ids=[doc_id])
-        if existing and existing['ids']:
-            continue  # Already embedded, skip
-        embedding = openai.Embedding.create(
-            input=text,
-            model="text-embedding-ada-002"
-        )["data"][0]["embedding"]
-        collection.add(
-            embeddings=[embedding],
-            documents=[text],
-            ids=[doc_id],
-            metadatas=[{"source": filename}]
-        )
+        if not text.strip():
+            continue  # skip empty
+        embedding = get_embedding(text)
+        index.add(np.array([embedding]))  # add to FAISS
+        stored_texts.append(text)
+        metadata.append({"source": filename})
 
 def retrieve_relevant_context(query, selected_pdf):
-    """Embed query and retrieve matching chunks from the selected PDF only."""
-    query_embedding = openai.Embedding.create(
-        input=query,
-        model="text-embedding-ada-002"
-    )["data"][0]["embedding"]
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=3,
-        where={"source": selected_pdf}
-    )
-    docs = results.get("documents", [])
-    flattened = [doc for sublist in docs for doc in sublist if doc]
-    context = "\n\n".join(flattened)
-    return context[:4000]  # Limit context size
+    """Retrieve relevant chunks matching the selected PDF."""
+    query_embedding = get_embedding(query)
+    D, I = index.search(np.array([query_embedding]), k=5)  # 5 best chunks
+    results = []
+    for idx in I[0]:
+        if idx < len(stored_texts) and metadata[idx]["source"] == selected_pdf:
+            results.append(stored_texts[idx])
+    context = "\n\n".join(results)
+    return context[:4000]  # limit
 
 def ask_gpt4(query, context=""):
-    """Ask GPT-4 using the retrieved context."""
+    """Ask GPT-4 using the context."""
     messages = [
         {"role": "system", "content": "You are a helpful assistant. Use the given context when answering."},
         {"role": "user", "content": f"Context: {context}\n\nQuestion: {query}"}
@@ -87,13 +71,13 @@ def extract_text_from_pdf(uploaded_pdf):
     texts = []
     for page in reader.pages:
         text = page.extract_text()
-        if text and text.strip():  # Only keep non-empty pages
+        if text and text.strip():
             texts.append(text)
     return texts
 
 def summarize_text(full_text):
-    """Ask GPT-4 to summarize the entire document."""
-    prompt = f"Please summarize the following document:\n\n{full_text[:10000]}"  # limit to first ~4k tokens
+    """Summarize the entire document."""
+    prompt = f"Please summarize the following document:\n\n{full_text[:10000]}"
     response = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[{"role": "user", "content": prompt}],
@@ -107,6 +91,13 @@ def summarize_text(full_text):
 # ------------------------------
 st.set_page_config(page_title="💬 Chat with PDFs + GPT-4", page_icon="📄")
 st.title("📄 Chat with your PDF Files + GPT-4")
+
+# Session states
+if "pdf_files" not in st.session_state:
+    st.session_state.pdf_files = {}
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
 # Sidebar Upload Section
 with st.sidebar:
@@ -132,10 +123,6 @@ if st.session_state.pdf_files:
     st.subheader("📝 Document Summary")
     st.markdown(st.session_state.pdf_files[selected_pdf]["summary"])
 
-# Session to maintain chat history
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
 # Display previous chat messages
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
@@ -154,7 +141,6 @@ if query and selected_pdf:
             answer = ask_gpt4(query, context)
             st.markdown(answer)
 
-            # Show the context chunks (sources) under the answer
             if context.strip():
                 with st.expander("📚 Sources (Context Used)"):
                     st.markdown(context)
